@@ -11,6 +11,7 @@
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
         inputs.devshell.flakeModule
+        flake-parts.flakeModules.easyOverlay
       ];
 
       systems = [
@@ -25,7 +26,6 @@
           packages = with pkgs; [
             config.packages.pythonWithDeps
             git
-            # Add other dev tools as needed
           ];
 
           env = [
@@ -54,6 +54,12 @@
           ];
         };
 
+        overlayAttrs = {
+          inherit (config.packages)
+            openwisp-controller
+            ;
+        };
+
         packages = {
           pythonWithDeps = pkgs.python3.withPackages (ps: [
             config.packages.openwisp-controller
@@ -62,7 +68,6 @@
             ps.django-redis
             ps.mock-ssh-server
             ps.responses
-            # Add other test deps
           ]);
 
           # Git-based dependencies
@@ -138,18 +143,6 @@
             doCheck = false;
           };
 
-          leaflet = pkgs.python3Packages.buildPythonPackage {
-            pname = "django-leaflet";
-            version = "0.30.0";
-            src = builtins.fetchTarball {
-              url = "https://github.com/timonweb/django-leaflet/archive/refs/tags/0.30.0.tar.gz";
-              sha256 = "1k8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q8q"; # Placeholder
-            };
-            format = "setuptools";
-            propagatedBuildInputs = with pkgs.python3Packages; [ django ];
-            doCheck = false;
-          };
-
           openwisp-utils = pkgs.python3Packages.buildPythonPackage {
             pname = "openwisp-utils";
             version = "1.3";
@@ -198,44 +191,37 @@
             doCheck = false;
           };
 
-          openwisp-controller = pkgs.python3Packages.buildPythonPackage {
+          openwisp-controller = pkgs.python3Packages.buildPythonApplication {
             pname = "openwisp-controller";
             version = "1.1.5"; # Update to actual version from openwisp_controller/__init__.py
             src = ./.;
 
             format = "setuptools";
 
-             propagatedBuildInputs = with pkgs.python3Packages; [
-               django
-               djangorestframework
-               config.packages.djangorestframework-gis
-               paramiko
-               scp
-               shortuuid
-               netaddr
-               django-import-export
-               config.packages.django-sortedm2m
-               django-reversion
-               django-taggit
-               django-cache-memoize
-               config.packages.netjsonconfig
-               config.packages.django-x509
-               config.packages.django-loci
-               config.packages.openwisp-utils
-               config.packages.openwisp-users
-               config.packages.openwisp-notifications
-               config.packages.openwisp-ipam
-             ];
-             doCheck = false;
-             postInstall = ''
-               cd $src
-               export PYTHONPATH=$out/lib/python*/site-packages:$PYTHONPATH
-               export DJANGO_SETTINGS_MODULE=openwisp_controller.settings
-               ${pkgs.python3}/bin/python manage.py collectstatic --noinput --clear
-               mkdir -p $out
-               cp -r static $out/
-             '';
-           };
+            propagatedBuildInputs = with pkgs.python3Packages; [
+              django
+              djangorestframework
+              config.packages.djangorestframework-gis
+              paramiko
+              scp
+              shortuuid
+              netaddr
+              django-import-export
+              config.packages.django-sortedm2m
+              django-reversion
+              django-taggit
+              django-cache-memoize
+              config.packages.netjsonconfig
+              config.packages.django-x509
+              config.packages.django-loci
+              config.packages.openwisp-utils
+              config.packages.openwisp-users
+              config.packages.openwisp-notifications
+              config.packages.openwisp-ipam
+            ];
+
+            doCheck = false;
+          };
         };
       };
 
@@ -255,6 +241,10 @@
             };
             nginx = {
               enable = lib.mkEnableOption "Nginx reverse proxy";
+              hostname = lib.mkOption {
+                type = lib.types.str;
+                description = "Hostname to listen on for openwisp-controller";
+              };
               extraConfig = lib.mkOption {
                 type = lib.types.attrs;
                 default = {};
@@ -262,11 +252,6 @@
               };
             };
             database = {
-              name = lib.mkOption {
-                type = lib.types.str;
-                default = "openwisp_controller";
-                description = "Database name";
-              };
               user = lib.mkOption {
                 type = lib.types.str;
                 default = "openwisp";
@@ -281,17 +266,20 @@
           };
           config = let
             owc-config = config.services.openwisp-controller;
-          in  lib.mkIf owc-config.enable {
-            services.postgresql = lib.mkIf .enable {
+          in lib.mkIf owc-config.enable {
+            services.postgresql = {
               enable = true;
-              ensureDatabases = [ owc-config.database.name ];
+              ensureDatabases = [ owc-config.database.user ];
               ensureUsers = [{
                 name = owc-config.database.user;
                 ensureDBOwnership = true;
+                ensureClauses = {
+                  login = true;
+                };
               }];
             };
 
-            services.redis = lib.mkIf owc-config.enable {
+            services.redis = {
               enable = true;
             };
 
@@ -304,33 +292,32 @@
               ];
               wantedBy = [ "multi-user.target" ];
               serviceConfig = {
-                ExecStartPre = [
-                  "${pkgs.python3}/bin/python ${./.}/manage.py migrate --settings=${owc-config.settingsModule} --noinput"
-                ];
+                # ExecStartPre = [
+                #   "${pkgs.python3}/bin/python ${./.}/manage.py migrate --settings=${owc-config.settingsModule} --noinput"
+                # ];
                 ExecStart = "${pkgs.python3Packages.gunicorn}/bin/gunicorn openwisp_controller.wsgi:application --bind 127.0.0.1:${toString owc-config.port} --workers 3";
                 WorkingDirectory = "${./.}";
-                Environment = lib.mkMerge [
-                  "PYTHONPATH=${./.}:${pkgs.python3.withPackages (ps: [ owc-config.package ])}/lib/python3.13/site-packages"
-                  "DATABASE_URL=postgresql://${owc-config.database.user}@localhost/${owc-config.database.name}"
-                  "REDIS_URL=redis://localhost:6379/0"
-                ];
-                User = "openwisp";
-                Group = "openwisp";
+                Environment = ''
+                  PYTHONPATH=${./.}:${pkgs.python3.withPackages (ps: [ owc-config.package ])}/lib/python3.13/site-packages
+                  DATABASE_URL=postgresql://${owc-config.database.user}@localhost/${owc-config.database.user}
+                  REDIS_URL=redis://localhost:6379/0
+                '';
+                DynamicUser = true;
               };
             };
 
             services.nginx = lib.mkIf owc-config.nginx.enable {
               enable = true;
-              virtualHosts."openwisp-controller" = lib.mkMerge [
+              virtualHosts."${owc-config.nginx.hostname}" = lib.mkMerge [
                 {
                   locations."/" = {
                     proxyPass = "http://127.0.0.1:${toString owc-config.port}";
-                    proxySetHeader = [
-                      "Host $host"
-                      "X-Real-IP $remote_addr"
-                      "X-Forwarded-For $proxy_add_x_forwarded_for"
-                      "X-Forwarded-Proto $scheme"
-                    ];
+                    extraConfig = ''
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                    '';
                   };
                   locations."/static/" = {
                     alias = "${owc-config.package}/static/";
